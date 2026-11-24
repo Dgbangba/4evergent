@@ -30,11 +30,13 @@
  */
 
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import { jwtVerify, createRemoteJWKSet } from "jose";
+import { getSharedConnection, closeSharedConnection } from "@4evergent/database";
 import type { AuthProvider, AuthenticatedPrincipal } from "@4evergent/shared";
 import { SlidingWindowRateLimiter, clientKey } from "./rate-limit.js";
+import { API_ERRORS } from "./error-codes.js";
 
 export const SESSION_COOKIE_NAME = "four_eg_session";
 
@@ -104,10 +106,13 @@ interface SessionRecord {
 class UserStore {
   private byId = new Map<string, StoredUser>();
   private db: DatabaseSync | null;
+  private dbPath?: string;
+  private closed = false;
 
   constructor(dbPath?: string) {
+    this.dbPath = dbPath;
     if (dbPath) {
-      this.db = new DatabaseSync(dbPath);
+      this.db = getSharedConnection(dbPath);
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS auth_users (
           id TEXT PRIMARY KEY,
@@ -121,6 +126,15 @@ class UserStore {
         );
       `);
     } else {
+      this.db = null;
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.dbPath) {
+      closeSharedConnection(this.dbPath);
       this.db = null;
     }
   }
@@ -189,10 +203,13 @@ class UserStore {
 class SessionStore {
   private map = new Map<string, SessionRecord>();
   private db: DatabaseSync | null;
+  private dbPath?: string;
+  private closed = false;
 
   constructor(dbPath?: string) {
+    this.dbPath = dbPath;
     if (dbPath) {
-      this.db = new DatabaseSync(dbPath);
+      this.db = getSharedConnection(dbPath);
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS auth_sessions (
           token TEXT PRIMARY KEY,
@@ -205,6 +222,15 @@ class SessionStore {
         CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at);
       `);
     } else {
+      this.db = null;
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.dbPath) {
+      closeSharedConnection(this.dbPath);
       this.db = null;
     }
   }
@@ -352,6 +378,7 @@ export interface AuthModule {
   /** Remove up to `limit` sessions whose expiration is at/before cutoff. */
   sweepExpiredSessions(cutoff: number, limit?: number): number;
   configStatus(): { email: boolean; google: boolean; stellar: boolean; registration: boolean };
+  close(): void;
 }
 
 export function createAuthModule(opts: {
@@ -494,7 +521,7 @@ export function createAuthModule(opts: {
     const key = clientKey(req, trustProxy);
     const decision = limiter.check(key);
     if (decision.limited) {
-      sendJson(res, 429, { error: "rate_limited" }, { "Retry-After": String(decision.retryAfterSeconds) });
+      sendJson(res, 429, { code: "RATE_LIMITED", error: API_ERRORS.RATE_LIMITED.message }, { "Retry-After": String(decision.retryAfterSeconds) });
       return null;
     }
     return key;
@@ -844,5 +871,9 @@ export function createAuthModule(opts: {
     sessionFor,
     configStatus,
     sweepExpiredSessions: (cutoff: number, limit?: number) => sessions.deleteExpiredBefore(cutoff, limit),
+    close: () => {
+      users.close();
+      sessions.close();
+    },
   };
 }

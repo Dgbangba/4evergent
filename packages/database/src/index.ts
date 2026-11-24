@@ -6,7 +6,20 @@ import type {
   SimulationResult,
   ScheduleStatus,
 } from "@4evergent/shared";
+import { toStroops } from "@4evergent/shared";
 import { clampOffset, clampLimit } from "./pagination.js";
+import {
+  idempotencyCutoff,
+  resolveIdempotencyWindowMs,
+  type ActivityStoreOptions,
+} from "./idempotency-window.js";
+
+export {
+  DEFAULT_IDEMPOTENCY_WINDOW_MS,
+  idempotencyCutoff,
+  resolveIdempotencyWindowMs,
+  type ActivityStoreOptions,
+} from "./idempotency-window.js";
 
 /**
  * ActivityStore — persistence interface for the transaction activity log.
@@ -27,6 +40,12 @@ export interface ActivityStore {
   update(id: string, patch: Partial<ActivityRecord>): Promise<ActivityRecord | null>;
   getByIdempotencyKey(ownerId: string, agentId: string, key: string): Promise<ActivityRecord | null>;
   recordIdempotent(key: string, record: ActivityRecord): Promise<{ record: ActivityRecord; created: boolean }>;
+  /**
+   * #109: release the Idempotency-Key of at most `limit` activities created
+   * before `cutoff` (ISO-8601). Only the key is cleared; the activity record
+   * (the audit trail) is never deleted. Returns the number of keys released.
+   */
+  releaseExpiredIdempotencyKeys?(cutoff: string, limit?: number): Promise<number>;
   /** Atomically reserve daily spending. Returns true if reservation succeeded, false if limit would be exceeded. */
   reserveDailySpending(agentId: string, asset: string, amount: string, limit: string, now?: Date): Promise<boolean>;
   /**
@@ -37,10 +56,13 @@ export interface ActivityStore {
    * would free another intent's reservation.
    */
   releaseDailySpending(agentId: string, asset: string, amount: string, now?: Date): Promise<void>;
-  /** Get current day's total spent for an agent. */
+  /** Get current day's reserved total for an agent, in INTEGER STROOPS (#374),
+   *  or null when nothing is reserved. Convert to a decimal at the boundary
+   *  (`fromStroops`); the enforcement path compares these integers directly. */
   getDailySpending(agentId: string, asset: string, now?: Date): Promise<number | null>;
   /** Remove at most `limit` rows with a UTC day earlier than cutoffDay. */
   sweepDailySpending(cutoffDay: string, limit?: number): Promise<number>;
+  close?(): void;
 }
 
 /**
@@ -81,6 +103,13 @@ export interface ApprovalStore {
    * conditional UPDATE ... WHERE status = ? statement.
    */
   updateIfStatus(id: string, expectedStatus: ApprovalStatus, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null>;
+  /**
+   * Transition pending approvals past their expiresAt to 'expired'.
+   * Bounded by `limit`. Calls `onSwept` for each transitioned record.
+   * Returns the count of transitioned records.
+   */
+  sweepExpired(now?: string, limit?: number, onSwept?: (record: ApprovalRecord) => void | Promise<void>): Promise<number>;
+  close?(): void;
 }
 
 export type ApprovalStatus =
@@ -124,10 +153,19 @@ export interface ApprovalRecord {
  */
 export class InMemoryActivityStore implements ActivityStore {
   private records = new Map<string, ActivityRecord>();
+  /** #374: values are INTEGER stroops (1 XLM = 10^7 stroops), not decimal XLM. */
   private dailySpending = new Map<string, number>();
   private idempotencyLock: Promise<unknown> = Promise.resolve();
   /** Serializes daily-spending check+commit per store instance (atomicity). */
   private dailySpendingLock: Promise<unknown> = Promise.resolve();
+  /** #109: Idempotency-Key replay window. */
+  readonly idempotencyWindowMs: number;
+  private readonly now: () => number;
+
+  constructor(options: ActivityStoreOptions = {}) {
+    this.idempotencyWindowMs = resolveIdempotencyWindowMs(options.idempotencyWindowMs);
+    this.now = options.now ?? Date.now;
+  }
 
   async record(record: ActivityRecord): Promise<void> {
     this.records.set(record.id, record);
@@ -169,13 +207,40 @@ export class InMemoryActivityStore implements ActivityStore {
     return rec?.ownerId === ownerId ? rec : null;
   }
 
+  /**
+   * #109: only a key bound to an activity created inside the replay window
+   * is returned. An older binding no longer suppresses a new request.
+   */
   async getByIdempotencyKey(ownerId: string, agentId: string, key: string): Promise<ActivityRecord | null> {
+    const cutoff = idempotencyCutoff(this.now(), this.idempotencyWindowMs);
     for (const rec of this.records.values()) {
-      if (rec.ownerId === ownerId && rec.agentId === agentId && rec.idempotencyKey === key) {
+      if (rec.ownerId === ownerId && rec.agentId === agentId && rec.idempotencyKey === key && rec.createdAt >= cutoff) {
         return rec;
       }
     }
     return null;
+  }
+
+  async releaseExpiredIdempotencyKeys(cutoff: string, limit = 500): Promise<number> {
+    let released = 0;
+    for (const rec of this.records.values()) {
+      if (released >= limit) break;
+      if (rec.idempotencyKey && rec.createdAt < cutoff) {
+        rec.idempotencyKey = null;
+        released++;
+      }
+    }
+    return released;
+  }
+
+  /** Clear the key of an expired binding so the key can be bound again (#109). */
+  private releaseExpiredBinding(ownerId: string, agentId: string, key: string): void {
+    const cutoff = idempotencyCutoff(this.now(), this.idempotencyWindowMs);
+    for (const rec of this.records.values()) {
+      if (rec.ownerId === ownerId && rec.agentId === agentId && rec.idempotencyKey === key && rec.createdAt < cutoff) {
+        rec.idempotencyKey = null;
+      }
+    }
   }
 
   /**
@@ -189,6 +254,7 @@ export class InMemoryActivityStore implements ActivityStore {
     const result = this.idempotencyLock.then(async () => {
       const existing = await this.getByIdempotencyKey(record.ownerId, record.agentId, key);
       if (existing) return { record: existing, created: false };
+      this.releaseExpiredBinding(record.ownerId, record.agentId, key);
       record.idempotencyKey = key;
       this.records.set(record.id, record);
       return { record, created: true };
@@ -199,9 +265,13 @@ export class InMemoryActivityStore implements ActivityStore {
   }
 
   async reserveDailySpending(agentId: string, asset: string, amount: string, limit: string, now = new Date()): Promise<boolean> {
-    const amountNum = parseFloat(amount);
-    const limitNum = parseFloat(limit);
-    if (isNaN(amountNum) || isNaN(limitNum)) return false;
+    // #374: compare integer stroops, not REAL XLM. Float addition drifts the
+    // ledger and falsely denies exact-limit intents; integer stroops compare
+    // exactly to the stroop. A non-canonical amount/limit (null from
+    // toStroops) is rejected, matching the strict parser (#264).
+    const amountStroops = toStroops(amount);
+    const limitStroops = toStroops(limit);
+    if (amountStroops === null || limitStroops === null) return false;
 
     const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
       .toISOString()
@@ -215,14 +285,19 @@ export class InMemoryActivityStore implements ActivityStore {
     // achieves the same via a conditional UPDATE.
     const result = this.dailySpendingLock.then(() => {
       const current = this.dailySpending.get(mapKey) ?? 0;
-      if (current + amountNum > limitNum) return false;
-      this.dailySpending.set(mapKey, current + amountNum);
+      if (current + amountStroops > limitStroops) return false;
+      this.dailySpending.set(mapKey, current + amountStroops);
       return true;
     });
     this.dailySpendingLock = result.catch(() => undefined);
     return result;
   }
 
+  /**
+   * #374: returns the current UTC day's reserved total in INTEGER STROOPS,
+   * or null when nothing is reserved. Convert to a decimal at the boundary;
+   * the enforcement path compares these integers directly.
+   */
   async getDailySpending(agentId: string, asset: string, now = new Date()): Promise<number | null> {
     const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
       .toISOString().slice(0, 10);
@@ -231,8 +306,9 @@ export class InMemoryActivityStore implements ActivityStore {
   }
 
   async releaseDailySpending(agentId: string, asset: string, amount: string, now = new Date()): Promise<void> {
-    const amountNum = parseFloat(amount);
-    if (isNaN(amountNum) || amountNum <= 0) return;
+    // #374: release integer stroops, matching the reservation unit.
+    const amountStroops = toStroops(amount);
+    if (amountStroops === null || amountStroops <= 0) return;
 
     const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
       .toISOString()
@@ -247,7 +323,7 @@ export class InMemoryActivityStore implements ActivityStore {
     // intent's reservation beyond zeroing this key.
     const result = this.dailySpendingLock.then(() => {
       const current = this.dailySpending.get(mapKey) ?? 0;
-      const next = current - amountNum;
+      const next = current - amountStroops;
       if (next <= 0) this.dailySpending.delete(mapKey);
       else this.dailySpending.set(mapKey, next);
     });
@@ -276,6 +352,29 @@ export class InMemoryActivityStore implements ActivityStore {
     this.records.set(id, updated);
     return updated;
   }
+
+  close(): void {}
+}
+
+function isApprovalRecordExpired(r: ApprovalRecord, now: string): boolean {
+  return r.status === "pending_approval" && r.expiresAt !== null && r.expiresAt <= now;
+}
+
+function resolveApprovalRecordStatus(r: ApprovalRecord, now = new Date().toISOString()): ApprovalRecord {
+  if (isApprovalRecordExpired(r, now)) {
+    return {
+      ...r,
+      status: "expired",
+      expiredAt: r.expiredAt ?? r.expiresAt,
+    };
+  }
+  return r;
+}
+
+function matchesApprovalStatus(r: ApprovalRecord, status: string | undefined, now: string): boolean {
+  if (status === undefined) return true;
+  const effective = isApprovalRecordExpired(r, now) ? "expired" : r.status;
+  return effective === status;
 }
 
 /**
@@ -291,51 +390,62 @@ export class InMemoryApprovalStore implements ApprovalStore {
   }
 
   async get(id: string): Promise<ApprovalRecord | null> {
-    return this.records.get(id) ?? null;
+    const rec = this.records.get(id);
+    return rec ? resolveApprovalRecordStatus(rec) : null;
   }
 
   async listByAgent(agentId: string, limit = 50, offset = 0, status?: string): Promise<ApprovalRecord[]> {
     const safeOffset = clampOffset(offset);
+    const now = new Date().toISOString();
     return [...this.records.values()]
-      .filter((r) => r.agentId === agentId && (status === undefined || r.status === status))
+      .filter((r) => r.agentId === agentId && matchesApprovalStatus(r, status, now))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(safeOffset, safeOffset + clampLimit(limit));
+      .slice(safeOffset, safeOffset + clampLimit(limit))
+      .map((r) => resolveApprovalRecordStatus(r, now));
   }
 
   async listByStatus(agentId: string, status: string, limit = 50, offset = 0): Promise<ApprovalRecord[]> {
     const safeOffset = clampOffset(offset);
+    const now = new Date().toISOString();
     return [...this.records.values()]
-      .filter((r) => r.agentId === agentId && r.status === status)
+      .filter((r) => r.agentId === agentId && matchesApprovalStatus(r, status, now))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(safeOffset, safeOffset + clampLimit(limit));
+      .slice(safeOffset, safeOffset + clampLimit(limit))
+      .map((r) => resolveApprovalRecordStatus(r, now));
   }
 
   async listAll(limit = 50, offset = 0): Promise<ApprovalRecord[]> {
     const safeOffset = clampOffset(offset);
+    const now = new Date().toISOString();
     return [...this.records.values()]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(safeOffset, safeOffset + clampLimit(limit));
+      .slice(safeOffset, safeOffset + clampLimit(limit))
+      .map((r) => resolveApprovalRecordStatus(r, now));
   }
 
   async listByOwner(ownerId: string, limit = 50, offset = 0, status?: string): Promise<ApprovalRecord[]> {
     const safeOffset = clampOffset(offset);
+    const now = new Date().toISOString();
     return [...this.records.values()]
-      .filter((r) => r.ownerId === ownerId && (status === undefined || r.status === status))
+      .filter((r) => r.ownerId === ownerId && matchesApprovalStatus(r, status, now))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(safeOffset, safeOffset + clampLimit(limit));
+      .slice(safeOffset, safeOffset + clampLimit(limit))
+      .map((r) => resolveApprovalRecordStatus(r, now));
   }
 
   async countByOwner(ownerId: string, status?: string): Promise<number> {
+    const now = new Date().toISOString();
     let n = 0;
     for (const r of this.records.values()) {
-      if (r.ownerId === ownerId && (status === undefined || r.status === status)) n++;
+      if (r.ownerId === ownerId && matchesApprovalStatus(r, status, now)) n++;
     }
     return n;
   }
 
   async getForOwner(id: string, ownerId: string): Promise<ApprovalRecord | null> {
     const rec = this.records.get(id);
-    return rec?.ownerId === ownerId ? rec : null;
+    if (!rec || rec.ownerId !== ownerId) return null;
+    return resolveApprovalRecordStatus(rec);
   }
 
   async update(id: string, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null> {
@@ -348,11 +458,42 @@ export class InMemoryApprovalStore implements ApprovalStore {
 
   async updateIfStatus(id: string, expectedStatus: ApprovalStatus, patch: Partial<ApprovalRecord>): Promise<ApprovalRecord | null> {
     const existing = this.records.get(id);
-    if (!existing || existing.status !== expectedStatus) return null;
-    const updated = { ...existing, ...patch, id: existing.id, updatedAt: new Date().toISOString() };
+    if (!existing) return null;
+    const now = new Date().toISOString();
+    const effective = isApprovalRecordExpired(existing, now) ? "expired" : existing.status;
+    if (effective !== expectedStatus) return null;
+    const updated = { ...existing, ...patch, id: existing.id, updatedAt: now };
     this.records.set(id, updated);
     return updated;
   }
+
+  async sweepExpired(
+    now = new Date().toISOString(),
+    limit = 500,
+    onSwept?: (record: ApprovalRecord) => void | Promise<void>
+  ): Promise<number> {
+    const safeLimit = clampLimit(limit);
+    let count = 0;
+    for (const [id, r] of this.records.entries()) {
+      if (r.status === "pending_approval" && r.expiresAt !== null && r.expiresAt <= now) {
+        const updated: ApprovalRecord = {
+          ...r,
+          status: "expired",
+          expiredAt: r.expiredAt ?? r.expiresAt ?? now,
+          updatedAt: now,
+        };
+        this.records.set(id, updated);
+        count++;
+        if (onSwept) {
+          await onSwept(updated);
+        }
+        if (count >= safeLimit) break;
+      }
+    }
+    return count;
+  }
+
+  close(): void {}
 }
 
 /**
@@ -379,7 +520,7 @@ export function createActivity(
   agentId: string,
   ownerId: string,
   intent: AgentIntent,
-  policyDecision: PolicyDecision,
+  policyDecision?: PolicyDecision | null,
   idempotencyKey?: string | null
 ): ActivityRecord {
   const now = new Date().toISOString();
@@ -389,7 +530,7 @@ export function createActivity(
     ownerId,
     idempotencyKey,
     intent,
-    policyDecision,
+    policyDecision: policyDecision ?? null,
     authorizationStatus: null,
     simulationResult: null,
     txHash: null,
@@ -490,7 +631,7 @@ export { getAllowedPreviousAgentStatuses } from "./agent-types.js";
 export type { AgentStore, AgentStatusTransitionResult, CreateAgentInput } from "./agent-types.js";
 
 // Policy configuration stores (Phase 28A)
-export { SQLitePolicyConfigStore } from "./policy-config-store.js";
+export { CorruptPolicyConfigError, SQLitePolicyConfigStore } from "./policy-config-store.js";
 export { InMemoryPolicyConfigStore } from "./in-memory-policy-config-store.js";
 export type { PolicyConfigStore } from "./policy-config-store.js";
 
@@ -515,11 +656,14 @@ export type { AuthorizationContext } from "./authorization.js";
 
 // Shared SQLite connection
 export {
+  EXPECTED_SCHEMA_VERSION,
+  runSchemaMigrations,
   getSharedConnection,
   getSchemaVersion,
   setSchemaVersion,
   closeSharedConnection,
   closeAllSharedConnections,
+  getSharedConnectionRefCount,
 } from "./shared-connection.js";
 
 // Pagination bounds (shared by every list* store method)

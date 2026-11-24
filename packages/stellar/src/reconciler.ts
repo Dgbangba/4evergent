@@ -1,4 +1,4 @@
-import type { ActivityStore, ExecutionRecord, ExecutionStore } from "@4evergent/database";
+import type { ActivityStore, ApprovalStore, ExecutionRecord, ExecutionStore } from "@4evergent/database";
 
 /**
  * TransactionStatus — typed result of a Stellar transaction lookup.
@@ -38,13 +38,18 @@ export interface ReconcilerOptions {
   maxAgeMs?: number;
   /**
    * Optional store for releasing the daily-spending reservation (#353) of a
-   * retired execution. Only used when the retired record carries proof of a
+   * retired execution, or syncing on-chain failure to the linked activity (#363).
+   * Only used for release when the retired record carries proof of a
    * reservation (`policyDecision.reservedDailySpending`); records without
    * proof (e.g. schedule-driven executions, whose decision is never written
-   * back to the record) release nothing. Best-effort: a release failure is
-   * swallowed so bookkeeping can never mask the retire.
+   * back to the record) release nothing. Best-effort: a release or update failure
+   * is swallowed so bookkeeping can never mask the reconciler outcome.
    */
-  activityStore?: Pick<ActivityStore, "releaseDailySpending">;
+  activityStore?: ActivityStore | (Pick<ActivityStore, "releaseDailySpending"> & Partial<ActivityStore>);
+  /**
+   * Optional store for syncing on-chain failure to the linked approval (#363).
+   */
+  approvalStore?: ApprovalStore | Partial<ApprovalStore>;
 }
 
 /**
@@ -68,7 +73,8 @@ export class TransactionStatusReconciler {
   private intervalMs: number;
   private clock: () => Date;
   private maxAgeMs: number;
-  private activityStore?: Pick<ActivityStore, "releaseDailySpending">;
+  private activityStore?: ActivityStore | (Pick<ActivityStore, "releaseDailySpending"> & Partial<ActivityStore>);
+  private approvalStore?: ApprovalStore | Partial<ApprovalStore>;
 
   constructor(
     private executionStore: ExecutionStore,
@@ -87,6 +93,7 @@ export class TransactionStatusReconciler {
     }
     this.maxAgeMs = options.maxAgeMs ?? DEFAULT_SUBMITTED_MAX_AGE_MS;
     this.activityStore = options.activityStore;
+    this.approvalStore = options.approvalStore;
   }
 
   start(): void {
@@ -156,7 +163,10 @@ export class TransactionStatusReconciler {
             // submit, but a record submitted before that fix keeps it).
             { status: "failed", error: "Transaction failed on-chain", updatedAt: this.clock().toISOString(), nextRetryAt: null }
           );
-          if (updated) result.failed++;
+          if (updated) {
+            result.failed++;
+            await this.syncFailedOnChain(execution, "Transaction failed on-chain");
+          }
         } else if (status === "not_found") {
           await this.retireIfOverAge(execution, result);
         }
@@ -227,6 +237,81 @@ export class TransactionStatusReconciler {
       await this.activityStore.releaseDailySpending(execution.agentId, reserved.asset, reserved.amount);
     } catch {
       // Best-effort bookkeeping — see above.
+    }
+  }
+
+  /**
+   * Synchronize on-chain failure to linked activity and approval (#363).
+   *
+   * Best-effort:
+   *   - Updates linked approval from `submitted` -> `failed` with on-chain error.
+   *   - Updates linked activity from `submitted` -> `failed` with on-chain error,
+   *     preserving txHash.
+   *   - Errors or missing records are logged/swallowed; the execution failure
+   *     remains the source of truth and the reconciler pass is never aborted.
+   */
+  private async syncFailedOnChain(execution: ExecutionRecord, errorMessage: string): Promise<void> {
+    const now = this.clock().toISOString();
+
+    // 1. Move linked approval from submitted -> failed
+    if (execution.approvalId && this.approvalStore) {
+      try {
+        if (typeof this.approvalStore.updateIfStatus === "function") {
+          await this.approvalStore.updateIfStatus(execution.approvalId, "submitted", {
+            status: "failed",
+            error: errorMessage,
+            updatedAt: now,
+          });
+        } else if (typeof this.approvalStore.get === "function" && typeof this.approvalStore.update === "function") {
+          const approval = await this.approvalStore.get(execution.approvalId);
+          if (approval && approval.status === "submitted") {
+            await this.approvalStore.update(execution.approvalId, {
+              status: "failed",
+              error: errorMessage,
+              updatedAt: now,
+            });
+          }
+        }
+      } catch (err) {
+        console.warn(`[reconciler] failed to update approval ${execution.approvalId} on on-chain failure:`, err);
+      }
+    }
+
+    // 2. Determine activityId: either from execution or falling back to linked approval
+    let activityId = execution.activityId;
+    if (!activityId && execution.approvalId && this.approvalStore && typeof this.approvalStore.get === "function") {
+      try {
+        const approval = await this.approvalStore.get(execution.approvalId);
+        if (approval?.activityId) {
+          activityId = approval.activityId;
+        }
+      } catch {
+        // Best-effort lookup
+      }
+    }
+
+    // 3. Move linked activity from submitted -> failed, preserving txHash
+    if (activityId && this.activityStore) {
+      try {
+        if (typeof (this.activityStore as any).updateIfStatus === "function") {
+          await (this.activityStore as any).updateIfStatus(activityId, "submitted", {
+            status: "failed",
+            error: errorMessage,
+            updatedAt: now,
+          });
+        } else if (typeof this.activityStore.get === "function" && typeof this.activityStore.update === "function") {
+          const act = await this.activityStore.get(activityId);
+          if (act && act.status === "submitted") {
+            await this.activityStore.update(activityId, {
+              status: "failed",
+              error: errorMessage,
+              updatedAt: now,
+            });
+          }
+        }
+      } catch (err) {
+        console.warn(`[reconciler] failed to update activity ${activityId} on on-chain failure:`, err);
+      }
     }
   }
 

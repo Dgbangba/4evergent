@@ -12,10 +12,11 @@
  *   FOREGENT_API_TIMEOUT_MS — Per-request timeout in ms (default: 5000)
  */
 
+import { parseArgs } from "node:util";
 import { exit } from "node:process";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
-import { COMMAND_TREE, COMMANDS_HELP, buildCommandTree, dispatchCommand } from "./commands.js";
+import { APPROVAL_LIST_USAGE, COMMAND_TREE, COMMANDS_HELP, buildCommandTree, dispatchCommand } from "./commands.js";
 import { generateCompletion } from "./completion.js";
 
 // The build replaces this lookup with the package version for a standalone CLI.
@@ -54,12 +55,63 @@ const API_TIMEOUT_MS = resolveApiTimeoutMs(process.env.FOREGENT_API_TIMEOUT_MS);
 // the documented timeout exit code without duplicating it in each catch block.
 let requestTimedOut = false;
 
+function formatApiErrorDetails(details: unknown): string {
+  if (details === undefined || details === null) return "";
+  if (typeof details === "string") {
+    const trimmed = details.trim();
+    return trimmed ? `\n  ${trimmed}` : "";
+  }
+  if (Array.isArray(details)) {
+    const lines = details
+      .filter((item): item is string | number | boolean =>
+        typeof item === "string" || typeof item === "number" || typeof item === "boolean"
+      )
+      .map((item) => String(item).trim())
+      .filter((line) => line.length > 0);
+    return lines.length > 0 ? lines.map((line) => `\n  - ${line}`).join("") : "";
+  }
+  if (typeof details === "object") {
+    const lines: string[] = [];
+    for (const [key, value] of Object.entries(details as Record<string, unknown>)) {
+      if (value === undefined || value === null) continue;
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        lines.push(`\n  ${key}: ${value}`);
+      } else if (Array.isArray(value)) {
+        const scalars = value
+          .filter((item): item is string | number | boolean =>
+            typeof item === "string" || typeof item === "number" || typeof item === "boolean"
+          )
+          .map((item) => String(item).trim())
+          .filter((item) => item.length > 0);
+        if (scalars.length > 0) {
+          lines.push(`\n  ${key}: ${scalars.join(", ")}`);
+        }
+      }
+    }
+    return lines.join("");
+  }
+  return "";
+}
+
 class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  public readonly code?: string;
+  public readonly details?: unknown;
+
+  constructor(public status: number, message: string, code?: string, details?: unknown) {
     // status 0 means "no HTTP response" (connection failure or timeout);
     // prefixing it with "HTTP 0:" would be misleading.
-    super(status === 0 ? message : `HTTP ${status}: ${message}`);
+    const normalizedCode = typeof code === "string" && code.trim() !== "" ? code.trim() : undefined;
+    const header =
+      status === 0
+        ? message
+        : normalizedCode
+          ? `HTTP ${status} [${normalizedCode}]: ${message}`
+          : `HTTP ${status}: ${message}`;
+    const formattedDetails = status === 0 ? "" : formatApiErrorDetails(details);
+    super(`${header}${formattedDetails}`);
     this.name = "ApiError";
+    this.code = normalizedCode;
+    this.details = details;
   }
 }
 
@@ -122,7 +174,8 @@ async function request(path: string, init: RequestInit = {}): Promise<ApiRespons
 
   if (!res.ok) {
     const msg = body?.error ?? body?.message ?? `Request failed`;
-    throw new ApiError(res.status, msg);
+    const code = typeof body?.code === "string" ? body.code : undefined;
+    throw new ApiError(res.status, msg, code, body?.details);
   }
 
   return { status: res.status, body };
@@ -190,9 +243,60 @@ async function cmdHealth() {
   }
 }
 
-async function cmdAgentList() {
+// GET /agents clamps limit to 1-200 and defaults to 200, so the CLI validates
+// the same range and omits the parameter entirely when the flag is absent.
+const AGENT_LIST_MAX_LIMIT = 200;
+const AGENT_LIST_USAGE =
+  "Usage: 4evergent agent list [--capability <capability>] [--limit <n>]";
+
+interface AgentListOptions {
+  capability?: string;
+  limit?: number;
+}
+
+/** Parses agent list flags, returning an error message for usage errors. */
+function parseAgentListArgs(args: string[]): AgentListOptions | string {
+  const options: AgentListOptions = {};
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--capability") {
+      const value = args[++i];
+      if (value === undefined || value === "") {
+        return `--capability requires a value.\n${AGENT_LIST_USAGE}`;
+      }
+      // Passed through unchanged: the API matches capabilities exactly and
+      // case-sensitively, so the CLI must not normalize the value.
+      options.capability = value;
+    } else if (arg === "--limit") {
+      const raw = args[++i];
+      const parsed = raw !== undefined && /^\d+$/.test(raw) ? Number(raw) : NaN;
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > AGENT_LIST_MAX_LIMIT) {
+        return `Invalid --limit '${raw ?? ""}': expected an integer between 1 and ${AGENT_LIST_MAX_LIMIT}.\n${AGENT_LIST_USAGE}`;
+      }
+      options.limit = parsed;
+    } else {
+      return `Unknown argument: ${arg}\n${AGENT_LIST_USAGE}`;
+    }
+  }
+
+  return options;
+}
+
+async function cmdAgentList(args: string[] = []) {
+  const parsed = parseAgentListArgs(args);
+  if (typeof parsed === "string") {
+    console.error(parsed);
+    return 1;
+  }
+
+  const query = new URLSearchParams();
+  if (parsed.capability !== undefined) query.set("capability", parsed.capability);
+  if (parsed.limit !== undefined) query.set("limit", String(parsed.limit));
+  const qs = query.toString();
+
   try {
-    const { body } = await request("/agents");
+    const { body } = await request(`/agents${qs ? `?${qs}` : ""}`);
     if (!body.agents || body.agents.length === 0) {
       console.log("No agents found.");
       return 0;
@@ -309,9 +413,39 @@ async function cmdAgentStatus(agentId: string, status: "active" | "paused" | "di
   }
 }
 
-async function cmdApprovalList() {
+const approvalStatuses = ["pending_approval", "approved", "rejected", "expired", "executing", "submitted", "confirmed", "failed"];
+
+async function cmdApprovalList(args: string[]) {
+  const params = new URLSearchParams();
   try {
-    const { body } = await request("/approvals");
+    const { values, positionals } = parseArgs({
+      args,
+      options: { status: { type: "string" }, limit: { type: "string" } },
+      allowPositionals: true,
+    });
+    if (values.status !== undefined) {
+      if (!approvalStatuses.includes(values.status)) {
+        throw new Error(`status must be one of: ${approvalStatuses.join(", ")}`);
+      }
+      params.set("status", values.status);
+    }
+    if (positionals.length > 1 || (positionals.length && values.limit !== undefined)) {
+      throw new Error("Specify the limit once, either as --limit or as a positional argument.");
+    }
+    const limit = values.limit ?? positionals[0];
+    if (limit !== undefined) {
+      if (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 200) {
+        throw new Error("limit must be an integer between 1 and 200");
+      }
+      params.set("limit", String(Number(limit)));
+    }
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+    console.error(APPROVAL_LIST_USAGE);
+    return 1;
+  }
+  try {
+    const { body } = await request(params.size ? `/approvals?${params}` : "/approvals");
     if (!body.approvals || body.approvals.length === 0) {
       console.log("No approvals found.");
       return 0;
@@ -347,9 +481,15 @@ async function cmdApprovalAction(approvalId: string, action: "approve" | "reject
   }
 }
 
-async function cmdExecutionList() {
+async function cmdExecutionList(limit?: string) {
+  const n = Number(limit || "100");
+  if (!Number.isInteger(n) || n < 1 || n > 100) {
+    console.error("Usage: 4evergent execution list [limit]");
+    console.error("limit must be an integer between 1 and 100");
+    return 1;
+  }
   try {
-    const { body } = await request("/executions?limit=100");
+    const { body } = await request(`/executions?limit=${n}`);
     const all: any[] = body.executions ?? [];
     if (all.length === 0) {
       console.log("No executions found.");
@@ -483,26 +623,87 @@ function formatSchedule(s: any) {
 `;
 }
 
+const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+
+function isValidStellarAddress(value: string): boolean {
+  return STELLAR_ADDRESS_RE.test(value);
+}
+
 /**
  * Build a typed intent object from CLI args.
  * Mirrors the AgentIntent union consumed by POST /agents/:id/intents.
- * `account_settings` is intentionally NOT exposed — the transaction
- * pipeline does not support it yet (server rejects with 400).
  */
 function buildIntentArgs(args: string[]): { intent: any; error?: string } {
   const type = args[0];
-  if (!type) return { intent: null, error: "intent type required (payment | trustline | contract_call)" };
+  if (!type) return { intent: null, error: "intent type required (payment | trustline | contract_call | account_settings)" };
 
   switch (type) {
     case "payment": {
-      const [, asset, amount, destination, reason, memo] = args;
-      if (!asset || !amount || !destination || !reason) {
-        return { intent: null, error: "payment requires: <asset> <amount> <destination> <reason> [memo]" };
+      let issuer: string | undefined;
+      const positional: string[] = [];
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "--issuer") {
+          const val = args[i + 1];
+          if (!val || val.startsWith("--")) {
+            return { intent: null, error: "--issuer requires a Stellar address (G...)" };
+          }
+          issuer = val;
+          i++;
+        } else if (arg.startsWith("--issuer=")) {
+          const val = arg.slice("--issuer=".length);
+          if (!val) {
+            return { intent: null, error: "--issuer requires a Stellar address (G...)" };
+          }
+          issuer = val;
+        } else {
+          positional.push(arg);
+        }
       }
+
+      const [asset, amount, destination, reason, memo] = positional;
+      if (!asset || !amount || !destination || !reason) {
+        return {
+          intent: null,
+          error: "payment requires: <asset> <amount> <destination> <reason> [memo] [--issuer <G...>]",
+        };
+      }
+
+      if (asset === "XLM") {
+        if (issuer !== undefined) {
+          return { intent: null, error: "--issuer is not valid for native XLM payments" };
+        }
+        return {
+          intent: {
+            type: "payment",
+            asset,
+            destination,
+            amount,
+            reason,
+            ...(memo ? { memo } : {}),
+          },
+        };
+      }
+
+      if (!issuer) {
+        return {
+          intent: null,
+          error: `non-native asset '${asset}' requires an issuer (--issuer <G...>)`,
+        };
+      }
+
+      if (!isValidStellarAddress(issuer)) {
+        return {
+          intent: null,
+          error: `invalid --issuer '${issuer}': must be a valid Stellar address (56-character G... address)`,
+        };
+      }
+
       return {
         intent: {
           type: "payment",
           asset,
+          assetDetails: { code: asset, issuer },
           destination,
           amount,
           reason,
@@ -549,10 +750,29 @@ function buildIntentArgs(args: string[]): { intent: any; error?: string } {
         },
       };
     }
-    case "account_settings":
-      return { intent: null, error: "account_settings is not supported by the transaction pipeline" };
+    case "account_settings": {
+      const [, setting, value, reason] = args;
+      if (!setting || !value || !reason) {
+        return { intent: null, error: "account_settings requires: <setting> <value> <reason>" };
+      }
+      // Attempt to parse value as JSON; if it fails, keep it as a plain string
+      let parsedValue: any;
+      try {
+        parsedValue = JSON.parse(value);
+      } catch {
+        parsedValue = value;
+      }
+      return {
+        intent: {
+          type: "account_settings",
+          setting,
+          value: parsedValue,
+          reason,
+        },
+      };
+    }
     default:
-      return { intent: null, error: `unknown intent type '${type}' (supported: payment, trustline, contract_call)` };
+      return { intent: null, error: `unknown intent type '${type}' (supported: payment, trustline, contract_call, account_settings)` };
   }
 }
 
@@ -661,8 +881,8 @@ async function cmdScheduleGet(agentId: string, scheduleId: string) {
 
 async function cmdIntentSubmit(agentId: string, args: string[], idempotencyKey: string | null) {
   if (!agentId) {
-    console.error("Usage: 4evergent intent submit <agent-id> <type> [args...] [--idempotency-key <key>]");
-    console.error("Types: payment | trustline | contract_call");
+    console.error("Usage: 4evergent intent submit <agent-id> <type> [args...] [--issuer <G...>] [--idempotency-key <key>]");
+    console.error("Types: payment | trustline | contract_call | account_settings");
     return 1;
   }
 
@@ -671,7 +891,7 @@ async function cmdIntentSubmit(agentId: string, args: string[], idempotencyKey: 
   const flagIdx = args.indexOf("--idempotency-key");
   if (flagIdx !== -1) {
     key = args[flagIdx + 1] ?? null;
-    args = args.slice(0, flagIdx);
+    args = [...args.slice(0, flagIdx), ...args.slice(flagIdx + 2)];
   }
 
   const { intent, error } = buildIntentArgs(args);
@@ -755,9 +975,22 @@ async function cmdAgentCreate(args: string[]) {
   }
 }
 
+const RECOGNIZED_POLICY_FIELDS = [
+  "maxTxAmount",
+  "dailySpendingLimit",
+  "allowedAssets",
+  "allowedDestinations",
+  "allowedContractIds",
+  "txTypeRestrictions",
+  "approvalThreshold",
+  "requireHumanApprovalForAmountAbove",
+] as const;
+
 async function cmdPolicyUpdate(agentId: string, args: string[]) {
   if (!agentId) {
     console.error("Usage: 4evergent policy update <agent-id> --rules '<json>'");
+    console.error(`  --rules must be a JSON object with at least one policy field: ${RECOGNIZED_POLICY_FIELDS.join(", ")}`);
+    console.error("  Note: pass the inner 'policy' object, not the 'policy get' envelope ({ agentId, policy, version, updatedAt }).");
     return 1;
   }
   const idx = args.indexOf("--rules");
@@ -773,13 +1006,34 @@ async function cmdPolicyUpdate(agentId: string, args: string[]) {
     return 1;
   }
 
+  if (typeof policy !== "object" || policy === null || Array.isArray(policy)) {
+    console.error(`Error: --rules must be a JSON object containing at least one recognized policy field (${RECOGNIZED_POLICY_FIELDS.join(", ")})`);
+    return 1;
+  }
+
+  const hasRecognizedField = RECOGNIZED_POLICY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(policy, field));
+  if (!hasRecognizedField) {
+    if (typeof policy.policy === "object" && policy.policy !== null && !Array.isArray(policy.policy)) {
+      console.error(
+        "Error: --rules appears to be a 'policy get' envelope ({ agentId, policy, version, updatedAt }). " +
+          "Pass the inner 'policy' object instead."
+      );
+      return 1;
+    }
+    console.error(
+      `Error: --rules contains no recognized policy fields. ` +
+        `Expected at least one of: ${RECOGNIZED_POLICY_FIELDS.join(", ")}`
+    );
+    return 1;
+  }
+
   try {
     const { body } = await request(`/agents/${encodeURIComponent(agentId)}/policy`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(policy),
     });
-    console.log(`Policy updated:\n  Agent: ${body.agentId}\n  Version: ${body.version}`);
+    console.log(`Policy updated:\n${formatPolicy(body)}`);
     return 0;
   } catch (err: any) {
     console.error(`Error: ${err.message}`);
@@ -789,7 +1043,7 @@ async function cmdPolicyUpdate(agentId: string, args: string[]) {
 
 async function cmdScheduleCreate(agentId: string, args: string[]) {
   if (!agentId || args.length < 2) {
-    console.error("Usage: 4evergent schedule create <agent-id> <cron-expression> <intent-type> [intent-args...] [--timezone UTC]");
+    console.error("Usage: 4evergent schedule create <agent-id> <cron-expression> <intent-type> [intent-args...] [--issuer <G...>] [--timezone UTC]");
     return 1;
   }
   const expression = args[0];
@@ -943,7 +1197,7 @@ const argv = process.argv.slice(2);
 export const dispatcherTree = buildCommandTree({
   health: () => cmdHealth(),
   agent: {
-    list: () => cmdAgentList(),
+    list: (args) => cmdAgentList(args),
     get: (args) => cmdAgentGet(args[0] ?? ""),
     create: (args) => cmdAgentCreate(args),
     pause: (args) => cmdAgentStatus(args[0] ?? "", "paused"),
@@ -954,13 +1208,13 @@ export const dispatcherTree = buildCommandTree({
     },
   },
   approval: {
-    list: () => cmdApprovalList(),
+    list: cmdApprovalList,
     get: (args) => cmdApprovalGet(args[0] ?? ""),
     approve: (args) => cmdApprovalAction(args[0] ?? "", "approve"),
     reject: (args) => cmdApprovalAction(args[0] ?? "", "reject"),
   },
   execution: {
-    list: () => cmdExecutionList(),
+    list: (args) => cmdExecutionList(args[0] ?? ""),
     get: (args) => cmdExecutionGet(args[0] ?? ""),
     retry: (args) => cmdExecutionRetry(args[0] ?? ""),
     cancel: (args) => cmdExecutionCancel(args[0] ?? ""),
