@@ -1,4 +1,11 @@
-import type { ExecutionRecord, ExecutionStore, RetryPolicy } from "@4evergent/database";
+import type {
+  ActivityStore,
+  ApprovalRecord,
+  ApprovalStore,
+  ExecutionRecord,
+  ExecutionStore,
+  RetryPolicy,
+} from "@4evergent/database";
 import { computeNextRetryAt, DEFAULT_RETRY_POLICY } from "@4evergent/database";
 
 export interface ExecutionResult {
@@ -58,6 +65,8 @@ export class ExecutionQueue {
   private retryPolicy: RetryPolicy = DEFAULT_RETRY_POLICY;
   private nowFn: () => Date = () => new Date();
   private preCheck?: PreCheckFn;
+  private approvalStore?: ApprovalStore;
+  private activityStore?: ActivityStore;
   private inFlight = new Map<
     string,
     {
@@ -78,6 +87,8 @@ export class ExecutionQueue {
     this.retryPolicy = options.retryPolicy ?? DEFAULT_RETRY_POLICY;
     this.nowFn = options.now ?? (() => new Date());
     this.preCheck = options.preCheck;
+    this.approvalStore = options.approvalStore;
+    this.activityStore = options.activityStore;
   }
 
   start(): void {
@@ -286,6 +297,48 @@ export class ExecutionQueue {
       updatedAt: now,
     });
     if (!updated) return { status: "conflict" };
+
+    // Issue #369: Cancellation Lifecycle Cleanup (Option 2 — Re-submission required).
+    // When an execution is cancelled, its linked approval and activity records must
+    // also be transitioned to terminal states to accurately represent the outcome.
+    // Under Option 2, cancelled executions are terminal and cannot be re-executed;
+    // a new intent must be submitted and approved.
+    const cancellationReason = "execution cancelled by user; re-submission required to execute again";
+
+    let linkedApproval: ApprovalRecord | null = null;
+    if (this.approvalStore && existing.approvalId) {
+      try {
+        const appr = await this.approvalStore.get(existing.approvalId);
+        if (appr && (appr.status === "approved" || appr.status === "executing")) {
+          linkedApproval = await this.approvalStore.update(existing.approvalId, {
+            status: "failed",
+            error: cancellationReason,
+          });
+        }
+      } catch (err) {
+        console.error("[execution-queue] failed to update linked approval on cancel:", err);
+      }
+    }
+
+    const targetActivityId = existing.activityId ?? linkedApproval?.activityId;
+    if (this.activityStore && targetActivityId) {
+      try {
+        const act = await this.activityStore.get(targetActivityId);
+        if (act && (act.status === "requires_approval" || act.status === "pending" || act.status === "approved")) {
+          await this.activityStore.update(targetActivityId, {
+            status: "failed",
+            ...(existing.approvalId || act.authorizationStatus === "pending_approval"
+              ? { authorizationStatus: "approved" }
+              : {}),
+            error: cancellationReason,
+            updatedAt: now,
+          });
+        }
+      } catch (err) {
+        console.error("[execution-queue] failed to update linked activity on cancel:", err);
+      }
+    }
+
     return { status: "cancelled", execution: updated };
   }
 
@@ -526,6 +579,9 @@ export interface ExecutionQueueOptions {
   retryPolicy?: RetryPolicy;
   /** Pre-check function to verify transaction status before blind retry */
   preCheck?: PreCheckFn;
+  /** Optional store references for linked record cleanup on cancellation (#369) */
+  approvalStore?: ApprovalStore;
+  activityStore?: ActivityStore;
 }
 
 function classifyUncaughtError(error: unknown): "transient" | "permanent" {

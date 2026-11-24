@@ -2,6 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   InMemoryExecutionStore,
+  InMemoryApprovalStore,
+  InMemoryActivityStore,
+  createApproval,
+  createActivity,
   classifyPipelineOutcome,
   classifyError,
   shouldRetry,
@@ -298,6 +302,54 @@ test("ExecutionQueue.cancel: queued → cancelled with completedAt and error", a
 
   const stored = await store.get(execution.id);
   assert.equal(stored?.status, "cancelled");
+});
+
+test("ExecutionQueue.cancel: cleans up linked approval and activity (#369)", async () => {
+  const store = new InMemoryExecutionStore();
+  const approvalStore = new InMemoryApprovalStore();
+  const activityStore = new InMemoryActivityStore();
+  const queue = new ExecutionQueue(
+    store,
+    async (rec) => ({ record: rec, success: true }),
+    async () => ({ accountId: () => "GDEST", sequenceNumber: () => "1", incrementSequenceNumber: () => {} }),
+    { approvalStore, activityStore }
+  );
+
+  const act = createActivity("agent-a", "owner-a", makeIntent(), {
+    result: "requires_approval",
+    reason: "threshold",
+    rule: "threshold",
+    intent: makeIntent(),
+  });
+  await activityStore.record(act);
+
+  const appr = createApproval(act.id, "agent-a", "owner-a", makeIntent(), {
+    result: "requires_approval",
+    reason: "threshold",
+    rule: "threshold",
+    intent: makeIntent(),
+  });
+  await approvalStore.record(appr);
+  await approvalStore.update(appr.id, { status: "approved" });
+
+  const execution = makeExecution({
+    status: "queued",
+    approvalId: appr.id,
+    activityId: act.id,
+  });
+  await store.record(execution);
+
+  const res = await queue.cancel(execution.id);
+  assert.equal(res.status, "cancelled");
+
+  const updatedAppr = await approvalStore.get(appr.id);
+  assert.equal(updatedAppr?.status, "failed");
+  assert.match(updatedAppr?.error ?? "", /execution cancelled by user/i);
+
+  const updatedAct = await activityStore.get(act.id);
+  assert.equal(updatedAct?.status, "failed");
+  assert.equal(updatedAct?.authorizationStatus, "approved");
+  assert.match(updatedAct?.error ?? "", /execution cancelled by user/i);
 });
 
 test("ExecutionQueue.cancel: before execution starts — queued is cancelled and never executed", async () => {

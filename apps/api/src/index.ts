@@ -581,11 +581,26 @@ export async function createApiServer(options: ServerOptions) {
           };
         } catch (err: unknown) {
           if (context?.signal?.aborted) {
-            if (record.activityId && options.activityStore) {
+            const cancellationReason = "execution cancelled by user; re-submission required to execute again";
+            if (record.approvalId) {
               try {
-                await options.activityStore.update(record.activityId, {
+                const appr = await approvals.get(record.approvalId);
+                if (appr && (appr.status === "approved" || appr.status === "executing")) {
+                  await approvals.update(record.approvalId, {
+                    status: "failed",
+                    error: cancellationReason,
+                  });
+                }
+              } catch {
+                // ApprovalStore update failure is non-critical
+              }
+            }
+            if (record.activityId) {
+              try {
+                await store.update(record.activityId, {
                   status: "failed",
-                  error: "cancelled by user",
+                  ...(record.approvalId ? { authorizationStatus: "approved" } : {}),
+                  error: cancellationReason,
                   updatedAt: new Date().toISOString(),
                 });
               } catch {
@@ -633,6 +648,8 @@ export async function createApiServer(options: ServerOptions) {
         intervalMs: options.executionQueue.intervalMs,
         concurrency: options.executionQueue.concurrency,
         preCheck,
+        approvalStore: approvals,
+        activityStore: store,
       });
 
     executionQueue.start();
@@ -1711,7 +1728,47 @@ export async function createApiServer(options: ServerOptions) {
     }
     if (result.status === "conflict") return apiError(res, "EXECUTION_CONFLICT");
 
-    return json(res, { execution: result.execution, message: "execution cancelled" });
+    // Issue #369: Cancellation Lifecycle Cleanup (Option 2 — Re-submission required).
+    // Ensure linked approval and activity records are updated to terminal states even if
+    // a custom ExecutionQueue was used without stores injected.
+    const cancellationReason = "execution cancelled by user; re-submission required to execute again";
+    const now = new Date().toISOString();
+
+    let linkedApproval = null;
+    if (execution.approvalId) {
+      try {
+        const appr = await approvals.get(execution.approvalId);
+        if (appr && (appr.status === "approved" || appr.status === "executing")) {
+          linkedApproval = await approvals.update(execution.approvalId, {
+            status: "failed",
+            error: cancellationReason,
+          });
+        }
+      } catch (err) {
+        log("error", "failed to update linked approval on cancel", { executionId, approvalId: execution.approvalId, error: String(err) });
+      }
+    }
+
+    const targetActivityId = execution.activityId ?? linkedApproval?.activityId;
+    if (targetActivityId) {
+      try {
+        const act = await store.get(targetActivityId);
+        if (act && (act.status === "requires_approval" || act.status === "pending" || act.status === "approved")) {
+          await store.update(targetActivityId, {
+            status: "failed",
+            ...(execution.approvalId || act.authorizationStatus === "pending_approval"
+              ? { authorizationStatus: "approved" }
+              : {}),
+            error: cancellationReason,
+            updatedAt: now,
+          });
+        }
+      } catch (err) {
+        log("error", "failed to update linked activity on cancel", { executionId, activityId: targetActivityId, error: String(err) });
+      }
+    }
+
+    return json(res, { execution: result.execution, message: "execution cancelled; re-submission required to execute again" });
   }
 
   async function handleIntent(ctx: RequestContext, req: any, res: any) {
