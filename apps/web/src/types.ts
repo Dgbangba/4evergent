@@ -34,7 +34,7 @@ export type AgentIntent = SharedAgentIntent & {
 export type PolicyDecision = Omit<SharedPolicyDecision, 'intent'> & { intent: AgentIntent };
 export type ActivityRecord = Omit<SharedActivityRecord, 'intent' | 'policyDecision'> & {
   intent: AgentIntent;
-  policyDecision: PolicyDecision;
+  policyDecision: PolicyDecision | null;
 };
 
 // API responses normalize optional agent fields, and omit internal metadata.
@@ -98,7 +98,8 @@ export type ExecutionStatus =
   | "confirmed"
   | "failed"
   | "dead_letter"
-  | "cancelled";
+  | "cancelled"
+  | "requires_approval";
 
 export interface ExecutionRecord {
   id: string;

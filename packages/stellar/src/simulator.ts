@@ -1,5 +1,11 @@
-import { Horizon, type Asset, type Transaction } from "@stellar/stellar-sdk";
+import { Horizon, rpc, type Asset, type Transaction } from "@stellar/stellar-sdk";
 import type { SimulationResult } from "@4evergent/shared";
+
+export const DEFAULT_SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
+
+export interface SimulationOutcome extends SimulationResult {
+  assembledTransaction?: Transaction;
+}
 
 /**
  * Minimum XLM a payment must carry to create a non-existent destination
@@ -37,18 +43,39 @@ const MIN_ACCOUNT_CREATION_XLM = 1;
  */
 export class StellarSimulator {
   private server: Horizon.Server;
+  private sorobanServer: rpc.Server;
 
   /**
    * @param horizonUrl Horizon endpoint (used when no server is injected).
    * @param server Optional `Horizon.Server` seam for tests — inject a fake to
    *        keep `simulate()` fully offline. Production callers omit this and
    *        the server is constructed from `horizonUrl`.
+   * @param sorobanRpcUrlOrServer Optional Soroban RPC endpoint URL or stubbed
+   *        `rpc.Server` seam for tests. Defaults to SOROBAN_RPC_URL env or
+   *        Testnet Soroban RPC.
    */
-  constructor(horizonUrl: string, server?: Horizon.Server) {
+  constructor(
+    horizonUrl: string,
+    server?: Horizon.Server,
+    sorobanRpcUrlOrServer?: string | rpc.Server
+  ) {
     this.server = server ?? new Horizon.Server(horizonUrl);
+    if (
+      sorobanRpcUrlOrServer &&
+      typeof sorobanRpcUrlOrServer === "object" &&
+      "simulateTransaction" in sorobanRpcUrlOrServer
+    ) {
+      this.sorobanServer = sorobanRpcUrlOrServer;
+    } else {
+      const url =
+        typeof sorobanRpcUrlOrServer === "string" && sorobanRpcUrlOrServer.length > 0
+          ? sorobanRpcUrlOrServer
+          : process.env.SOROBAN_RPC_URL || DEFAULT_SOROBAN_RPC_URL;
+      this.sorobanServer = new rpc.Server(url, { allowHttp: url.startsWith("http://") });
+    }
   }
 
-  async simulate(transaction: Transaction): Promise<SimulationResult> {
+  async simulate(transaction: Transaction): Promise<SimulationOutcome> {
     const ops = transaction.operations.length;
 
     try {
@@ -126,6 +153,46 @@ export class StellarSimulator {
       if (op.type !== "payment") continue;
       const dest = await this.checkDestination(op);
       if (!dest.ok) return fail(transaction.fee, ops, dest.error);
+    }
+
+    // 8. Soroban RPC simulation & assembly for contract invocation transactions.
+    const isSoroban = transaction.operations.some(
+      (op) =>
+        op.type === "invokeHostFunction" ||
+        (op as any).type === "extendFootprintTtl" ||
+        (op as any).type === "restoreFootprint"
+    );
+
+    if (isSoroban) {
+      let simResponse: any;
+      try {
+        simResponse = await this.sorobanServer.simulateTransaction(transaction);
+      } catch (e: any) {
+        return fail(transaction.fee, ops, `Soroban simulation failed: ${e.message}`);
+      }
+
+      if (rpc.Api.isSimulationError(simResponse)) {
+        return fail(transaction.fee, ops, `Soroban simulation failed: ${simResponse.error}`);
+      }
+
+      if (!rpc.Api.isSimulationSuccess(simResponse)) {
+        return fail(transaction.fee, ops, "Soroban simulation failed: simulation was not successful");
+      }
+
+      let assembledTx: Transaction;
+      try {
+        assembledTx = rpc.assembleTransaction(transaction, simResponse).build();
+      } catch (e: any) {
+        return fail(transaction.fee, ops, `Soroban transaction assembly failed: ${e.message}`);
+      }
+
+      return {
+        success: true,
+        fee: assembledTx.fee,
+        operations: ops,
+        warnings,
+        assembledTransaction: assembledTx,
+      };
     }
 
     return {

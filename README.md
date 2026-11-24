@@ -177,7 +177,7 @@ pnpm --filter @4evergent/api dev
 pnpm --filter @4evergent/web dev
 ```
 
-The dashboard connects to `http://localhost:3000`. Set `VITE_API_BASE` env var to point to a different API URL. The local development dashboard shows agent activity and lets operators review approvals and submit XLM payment intents. Rejecting an approval or deleting a recurring schedule opens a confirmation dialog. Choose Cancel or press Escape to keep the record. All policy enforcement, signing, and submission remain server-side.
+The dashboard connects to `http://localhost:3000`. Set `VITE_API_BASE` env var to point to a different API URL. Dashboard requests time out after 10 seconds by default. Set `VITE_API_TIMEOUT_MS` to a positive integer in milliseconds to change the deadline. The local development dashboard shows agent activity and lets operators review approvals and submit XLM payment intents. Rejecting an approval or deleting a recurring schedule opens a confirmation dialog. Choose Cancel or press Escape to keep the record. All policy enforcement, signing, and submission remain server-side.
 
 Each package has its own `package.json` with `build`, `dev`, `test`, and `typecheck` scripts.
 
@@ -266,7 +266,7 @@ export FOREGENT_API_KEY=your-api-key
 4evergent health
 4evergent agent list
 4evergent agent pause <id>
-4evergent approval list
+4evergent approval list --status pending_approval --limit 10
 4evergent approval approve <id>
 4evergent execution list
 4evergent policy get <agent-id>

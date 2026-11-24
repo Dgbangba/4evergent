@@ -9,6 +9,7 @@ All notable changes to this project are recorded in this file.
 - Live submission gate requiring explicit `LIVE_SUBMIT=1` opt-in before real Testnet submission (Phase 21)
 - Atomic daily spending reservation via dedicated `daily_spending` table with conditional SQL updates (Phase 23)
 - Atomic idempotency reservation via unique database constraints and concurrent-map serialization (Phase 23)
+- `Idempotency-Key` replay window: keys are honoured for 24 hours by default (`IDEMPOTENCY_KEY_WINDOW_SECONDS`), with the same expiry in the in-memory and SQLite stores; expired keys are released by the retention worker without deleting activity records (#109, ADR-023)
 - Numeric amount validation in PolicyEngine rejecting negative, zero, and malformed inputs (Phase 23)
 - Per-account sequence serialization via `AccountSequenceCoordinator` preventing sequence collisions (Phase 25)
 - Sequence coordination wrap for direct ALLOW intents and synchronous approval fallback execution (Phase 26A)

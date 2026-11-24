@@ -1,7 +1,8 @@
 // Stellar transaction pipeline
 export { StellarTransactionBuilder, resolveBaseFeeStroops, DEFAULT_BASE_FEE_STROOPS, STELLAR_BASE_FEE_ENV_VAR } from "./transaction-builder.js";
 export type { StellarTransactionBuilderOptions } from "./transaction-builder.js";
-export { StellarSimulator } from "./simulator.js";
+export { StellarSimulator, DEFAULT_SOROBAN_RPC_URL } from "./simulator.js";
+export type { SimulationOutcome } from "./simulator.js";
 export { StellarSubmitter } from "./submitter.js";
 export { TransactionPipeline } from "./pipeline.js";
 export type { PipelineOptions, PipelineExecuteInput, PipelineOutcome, ExecuteApprovedOptions } from "./pipeline.js";
@@ -19,7 +20,7 @@ export type { Signer } from "./signer.js";
 export { TestnetLocalSigner } from "./testnet-local-signer.js";
 
 // Network safety guard (Phase 21)
-export { validateStellarNetwork, isLiveSubmitEnabled, TESTNET_HORIZON_URL, TESTNET_PASSPHRASE } from "./network-guard.js";
+export { validateStellarNetwork, isLiveSubmitEnabled, TESTNET_HORIZON_URL, TESTNET_SOROBAN_RPC_URL, TESTNET_PASSPHRASE } from "./network-guard.js";
 export type { NetworkValidationResult } from "./network-guard.js";
 
 // Policy resolver (Phase 28A)
