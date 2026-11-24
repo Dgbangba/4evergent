@@ -197,7 +197,14 @@ export const api = {
       { method: 'POST', body: JSON.stringify({}) }
     ),
 
-  submitPayment: (agentId: string, intent: SubmitPaymentIntent, idempotencyKey?: string) => {
+  submitAccountSettings: (agentId: string, intent: SubmitAccountSettingsIntent, idempotencyKey?: string) => {
+    const trimmedKey = idempotencyKey?.trim();
+    return request<IntentResponse>(`/agents/${encodeURIComponent(agentId)}/intents`, {
+      method: 'POST',
+      body: JSON.stringify({ ...intent, type: 'account_settings' }),
+      ...(trimmedKey ? { headers: { 'Idempotency-Key': trimmedKey } } : {}),
+    });
+  },
     const trimmedKey = idempotencyKey?.trim();
     return request<IntentResponse>(`/agents/${encodeURIComponent(agentId)}/intents`, {
       method: 'POST',

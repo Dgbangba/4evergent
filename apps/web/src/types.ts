@@ -19,6 +19,7 @@ export type {
   SimulationResult,
   PaymentIntent as SubmitPaymentIntent,
   TrustlineIntent as SubmitTrustlineIntent,
+  AccountSettingsIntent as SubmitAccountSettingsIntent,
 } from '@4evergent/shared';
 
 type UnionKeys<T> = T extends unknown ? keyof T : never;

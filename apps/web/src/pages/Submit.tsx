@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import type { SubmitPaymentIntent } from '../types';
+import type { SubmitPaymentIntent, SubmitAccountSettingsIntent } from '../types';
 
 interface SubmitResult {
   agentId: string;
@@ -24,7 +24,14 @@ interface SubmitFailure {
 export default function Submit() {
   const [agents, setAgents] = useState<{ id: string; displayName: string }[]>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
-  const [intentType, setIntentType] = useState<'payment' | 'trustline'>('payment');
+  // State for account settings intent
+  const [accountSetting, setAccountSetting] = useState('home_domain');
+  const [settingValue, setSettingValue] = useState('');
+  const [jsonError, setJsonError] = useState<string | null>(null);
+
+  // Extend intent type options
+  const [intentType, setIntentType] = useState<'payment' | 'trustline' | 'account_settings'>('payment');
+
   const [amount, setAmount] = useState('');
   const [destination, setDestination] = useState('');
   const [assetCode, setAssetCode] = useState<'XLM' | 'USDC' | 'BTC' | 'other'>('XLM');
@@ -85,6 +92,7 @@ export default function Submit() {
     setResult(null);
     if (!selectedAgent) return setError('Select an agent');
     if (!reason || reason.length < 3) return setError('Reason must be at least 3 characters');
+    if (intentType === 'account_settings' && jsonError) return setError('Invalid JSON');
 
     setLoading(true);
     if (intentType === 'payment') {
@@ -108,7 +116,7 @@ export default function Submit() {
         })
         .catch((e: any) => handleFailure(selectedAgent, e))
         .finally(() => setLoading(false));
-    } else {
+    } else if (intentType === 'trustline') {
       if (!trustlineAssetCode || trustlineAssetCode.length < 1) { setLoading(false); return setError('Asset code is required'); }
       if (trustlineAssetCode === 'XLM') { setLoading(false); return setError('XLM is native — use payment instead'); }
       if (!trustlineIssuer || !trustlineIssuer.startsWith('G')) { setLoading(false); return setError('Issuer must be a valid Stellar account (G...)'); }
@@ -244,7 +252,7 @@ export default function Submit() {
               <input id="destination" type="text" value={destination} onChange={(e) => setDestination(e.target.value)} className="input" />
             </div>
           </>
-        ) : (
+        ) : intentType === 'trustline' ? (
           <>
             <div className="field">
               <label htmlFor="tl-asset-code">Asset Code</label>
@@ -257,6 +265,29 @@ export default function Submit() {
             <div className="field">
               <label htmlFor="tl-limit">Trustline Limit (optional)</label>
               <input id="tl-limit" type="number" step="0.0000001" min="0" value={trustlineLimit} onChange={(e) => setTrustlineLimit(e.target.value)} placeholder="No limit" className="input" />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="field">
+              <label htmlFor="account-setting">Setting</label>
+              <select id="account-setting" value={accountSetting} onChange={(e) => setAccountSetting(e.target.value)} className="select">
+                <option value="home_domain">home_domain</option>
+                <option value="inflation_destination">inflation_destination</option>
+                <option value="signer">signer</option>
+                <option value="thresholds">thresholds</option>
+                <option value="set_flags">set_flags</option>
+                <option value="clear_flags">clear_flags</option>
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="setting-value">Value (JSON)</label>
+              <textarea id="setting-value" value={settingValue} onChange={(e) => {
+                setSettingValue(e.target.value);
+                try { JSON.parse(e.target.value); setJsonError(null); } catch { setJsonError('Invalid JSON'); }
+              }} className="input" rows={4} placeholder="e.g. { \"homeDomain\": \"example.com\" }" aria-describedby="setting-value-hint" />
+              <div id="setting-value-hint" className="field-hint">Enter a JSON value appropriate for the selected setting.</div>
+              {jsonError && <div className="error-banner" role="alert">{jsonError}</div>}
             </div>
           </>
         )}
